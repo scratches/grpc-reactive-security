@@ -18,6 +18,7 @@ import org.springframework.grpc.server.GlobalServerInterceptor;
 import org.springframework.http.HttpCookie;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.codec.ServerCodecConfigurer;
 import org.springframework.http.server.reactive.AbstractServerHttpRequest;
 import org.springframework.http.server.reactive.AbstractServerHttpResponse;
@@ -29,6 +30,7 @@ import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.WebFilterChainProxy;
+import org.springframework.security.web.server.util.matcher.PathPatternParserServerWebExchangeMatcher;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.server.ServerWebExchange;
@@ -61,6 +63,7 @@ public class DemoApplication {
 	@Bean
 	public SecurityWebFilterChain security(ServerHttpSecurity http) {
 		return http.authorizeExchange(exchanges -> exchanges
+		.pathMatchers("/Simple/StreamHello").hasAnyRole("ROLE_ADMIN")
 				.anyExchange().authenticated())
 				.httpBasic(Customizer.withDefaults())
 				.formLogin(Customizer.withDefaults())
@@ -98,8 +101,9 @@ class CustomInterceptor implements ServerInterceptor {
 			ServerCallHandler<ReqT, RespT> next) {
 		AtomicReference<SecurityContext> securityContext = new AtomicReference<>();
 		String path = "/" + call.getMethodDescriptor().getFullMethodName();
+		FakeServerHttpResponse response = new FakeServerHttpResponse();
 		filterChain.filter(new DefaultServerWebExchange(new FakeServerHttpRequest(URI.create(path), headers(headers)),
-				new FakeServerHttpResponse(),
+				response,
 				new DefaultWebSessionManager(),
 				ServerCodecConfigurer.create(), new AcceptHeaderLocaleContextResolver()), new WebFilterChain() {
 
@@ -115,7 +119,13 @@ class CustomInterceptor implements ServerInterceptor {
 		SecurityContext context = securityContext.get();
 		log.info("Context: " + context);
 		if (context == null) {
-			call.close(Status.PERMISSION_DENIED, new Metadata());
+			if (response.getStatusCode() == HttpStatus.UNAUTHORIZED) {
+				call.close(Status.UNAUTHENTICATED, new Metadata());
+			} else if (response.getStatusCode() == HttpStatus.FORBIDDEN) {
+				call.close(Status.PERMISSION_DENIED, new Metadata());
+			} else {
+				call.close(Status.UNKNOWN, new Metadata());
+			}
 		} else {
 			SecurityContextHolder.setContext(context);
 		}

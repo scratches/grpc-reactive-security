@@ -3,6 +3,7 @@ package com.example.demo;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.scheduling.annotation.Async;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 
 import com.example.demo.proto.HelloReply;
@@ -19,6 +20,7 @@ public class GrpcServerService extends SimpleGrpc.SimpleImplBase {
 	@Override
 	public void sayHello(HelloRequest req, StreamObserver<HelloReply> responseObserver) {
 		log.info("Hello " + req.getName());
+		log.info("Security: " + SecurityContextHolder.getContext());
 		HelloReply reply = HelloReply.newBuilder().setMessage("Hello ==> " + req.getName()).build();
 		responseObserver.onNext(reply);
 		responseObserver.onCompleted();

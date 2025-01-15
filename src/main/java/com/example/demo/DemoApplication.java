@@ -1,8 +1,11 @@
 package com.example.demo;
 
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -30,7 +33,6 @@ import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.web.server.SecurityWebFilterChain;
 import org.springframework.security.web.server.WebFilterChainProxy;
-import org.springframework.security.web.server.util.matcher.PathPatternParserServerWebExchangeMatcher;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.server.ServerWebExchange;
@@ -41,7 +43,6 @@ import org.springframework.web.server.session.DefaultWebSessionManager;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
-import io.grpc.ForwardingServerCallListener;
 import io.grpc.Metadata;
 import io.grpc.Metadata.Key;
 import io.grpc.ServerCall;
@@ -62,13 +63,15 @@ public class DemoApplication {
 
 	@Bean
 	public SecurityWebFilterChain security(ServerHttpSecurity http) {
-		return http.authorizeExchange(exchanges -> exchanges
-		.pathMatchers("/Simple/StreamHello").hasAnyRole("ROLE_ADMIN")
-				.anyExchange().authenticated())
-				.httpBasic(Customizer.withDefaults())
-				.formLogin(Customizer.withDefaults())
-				.csrf(csrf -> csrf.disable())
-				.build();
+		return http
+			.authorizeExchange(exchanges -> exchanges.pathMatchers("/Simple/StreamHello")
+				.hasAnyRole("ROLE_ADMIN")
+				.anyExchange()
+				.authenticated())
+			.httpBasic(Customizer.withDefaults())
+			.formLogin(Customizer.withDefaults())
+			.csrf(csrf -> csrf.disable())
+			.build();
 	}
 
 	@Bean
@@ -79,16 +82,12 @@ public class DemoApplication {
 	}
 
 	static ThreadFactory getThreadFactory(String nameFormat, boolean daemon) {
-		return new ThreadFactoryBuilder()
-				.setDaemon(daemon)
-				.setNameFormat(nameFormat)
-				.build();
+		return new ThreadFactoryBuilder().setDaemon(daemon).setNameFormat(nameFormat).build();
 	}
+
 }
 
 class CustomInterceptor implements ServerInterceptor {
-
-	private static Log log = LogFactory.getLog(CustomInterceptor.class);
 
 	private WebFilterChainProxy filterChain;
 
@@ -99,13 +98,29 @@ class CustomInterceptor implements ServerInterceptor {
 	@Override
 	public <ReqT, RespT> Listener<ReqT> interceptCall(ServerCall<ReqT, RespT> call, Metadata headers,
 			ServerCallHandler<ReqT, RespT> next) {
+		return new CustomListener<>(filterChain, call, headers, next.startCall(call, headers));
+	}
+
+}
+
+class CustomListener<ReqT> extends ServerCall.Listener<ReqT> {
+
+	private static final Log log = LogFactory.getLog(CustomListener.class);
+
+	private final List<Consumer<Listener<ReqT>>> events = new ArrayList<>();
+
+	private ServerCall.Listener<ReqT> delegate;
+
+	private boolean isClosed;
+
+	CustomListener(WebFilterChainProxy filterChain, ServerCall<ReqT, ?> call, Metadata headers,
+			ServerCall.Listener<ReqT> listener) {
 		AtomicReference<SecurityContext> securityContext = new AtomicReference<>();
 		String path = "/" + call.getMethodDescriptor().getFullMethodName();
 		FakeServerHttpResponse response = new FakeServerHttpResponse();
 		filterChain.filter(new DefaultServerWebExchange(new FakeServerHttpRequest(URI.create(path), headers(headers)),
-				response,
-				new DefaultWebSessionManager(),
-				ServerCodecConfigurer.create(), new AcceptHeaderLocaleContextResolver()), new WebFilterChain() {
+				response, new DefaultWebSessionManager(), ServerCodecConfigurer.create(),
+				new AcceptHeaderLocaleContextResolver()), new WebFilterChain() {
 
 					@Override
 					public Mono<Void> filter(ServerWebExchange exchange) {
@@ -115,21 +130,105 @@ class CustomInterceptor implements ServerInterceptor {
 						});
 					}
 
-				}).block();
-		SecurityContext context = securityContext.get();
-		log.info("Context: " + context);
-		if (context == null) {
-			if (response.getStatusCode() == HttpStatus.UNAUTHORIZED) {
-				call.close(Status.UNAUTHENTICATED, new Metadata());
-			} else if (response.getStatusCode() == HttpStatus.FORBIDDEN) {
-				call.close(Status.PERMISSION_DENIED, new Metadata());
-			} else {
-				call.close(Status.UNKNOWN, new Metadata());
-			}
-		} else {
-			SecurityContextHolder.setContext(context);
+				})
+			.subscribe(null, t -> {
+				isClosed = true;
+				call.close(Status.fromThrowable(t), new Metadata());
+			}, () -> {
+				SecurityContext context = securityContext.get();
+				log.info("Context: " + context);
+				if (context == null) {
+					isClosed = true;
+					if (response.getStatusCode() == HttpStatus.UNAUTHORIZED) {
+						call.close(Status.UNAUTHENTICATED, new Metadata());
+					}
+					else if (response.getStatusCode() == HttpStatus.FORBIDDEN) {
+						call.close(Status.PERMISSION_DENIED, new Metadata());
+					}
+					else {
+						call.close(Status.UNKNOWN, new Metadata());
+					}
+				}
+				else {
+					SecurityContextHolder.setContext(context);
+					try {
+						setDelegate(listener);
+					}
+					catch (Exception e) {
+						isClosed = true;
+						call.close(Status.fromThrowable(e), new Metadata());
+					}
+				}
+			});
+	}
+
+	@Override
+	public void onComplete() {
+		if (isClosed) {
+			return;
 		}
-		return new CustomListener<ReqT>(next.startCall(call, headers));
+		executeOrDelay(delegate -> {
+			delegate.onComplete();
+			log.info("onComplete " + SecurityContextHolder.getContext());
+			SecurityContextHolder.clearContext();
+		});
+	}
+
+	@Override
+	public void onCancel() {
+		if (isClosed) {
+			return;
+		}
+		executeOrDelay(delegate -> {
+			delegate.onCancel();
+			log.info("onCancel " + SecurityContextHolder.getContext());
+			SecurityContextHolder.clearContext();
+		});
+	}
+
+	@Override
+	public void onMessage(ReqT message) {
+		if (isClosed) {
+			return;
+		}
+		executeOrDelay(delegate -> {
+			delegate.onMessage(message);
+			log.info("onMessage " + SecurityContextHolder.getContext());
+		});
+	}
+
+	@Override
+	public void onHalfClose() {
+		if (isClosed) {
+			return;
+		}
+		executeOrDelay(delegate -> {
+			delegate.onHalfClose();
+			log.info("onHalfClose " + SecurityContextHolder.getContext());
+		});
+	}
+
+	@Override
+	public void onReady() {
+		if (isClosed) {
+			return;
+		}
+		executeOrDelay(delegate -> {
+			delegate.onReady();
+			log.info("onReady " + SecurityContextHolder.getContext());
+		});
+	}
+
+	void setDelegate(ServerCall.Listener<ReqT> delegate) {
+		this.delegate = delegate;
+		try {
+			for (Consumer<ServerCall.Listener<ReqT>> event : events) {
+				event.accept(delegate);
+			}
+		}
+		finally {
+			events.clear();
+		}
 	}
 
 	private MultiValueMap<String, String> headers(Metadata headers) {
@@ -141,28 +240,14 @@ class CustomInterceptor implements ServerInterceptor {
 		}
 		return result;
 	}
-}
 
-class CustomListener<ReqT> extends ForwardingServerCallListener.SimpleForwardingServerCallListener<ReqT> {
-
-	private static Log log = LogFactory.getLog(CustomListener.class);
-
-	public CustomListener(ServerCall.Listener<ReqT> delegate) {
-		super(delegate);
-	}
-
-	@Override
-	public void onComplete() {
-		super.onComplete();
-		log.info("Completed " + SecurityContextHolder.getContext());
-		SecurityContextHolder.clearContext();
-	}
-
-	@Override
-	public void onCancel() {
-		super.onCancel();
-		log.info("Canceled " + SecurityContextHolder.getContext());
-		SecurityContextHolder.clearContext();
+	private void executeOrDelay(Consumer<ServerCall.Listener<ReqT>> consumer) {
+		if (this.delegate != null) {
+			consumer.accept(delegate);
+		}
+		else {
+			events.add(consumer);
+		}
 	}
 
 }
@@ -199,6 +284,7 @@ class FakeServerHttpResponse extends AbstractServerHttpResponse {
 	@Override
 	protected void applyCookies() {
 	}
+
 }
 
 class FakeServerHttpRequest extends AbstractServerHttpRequest {
@@ -226,4 +312,5 @@ class FakeServerHttpRequest extends AbstractServerHttpRequest {
 	public <T> T getNativeRequest() {
 		return null;
 	}
+
 }
